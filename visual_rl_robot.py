@@ -1,14 +1,3 @@
-"""
-Лабораторная работа №6: Visual Reinforcement Learning
-Обучение робота управлению по изображению с камеры
-
-Установка зависимостей:
-pip install gymnasium pybullet stable-baselines3 torch torchvision numpy opencv-python
-
-Запуск:
-python visual_rl_robot.py
-"""
-
 import gymnasium as gym
 from gymnasium import spaces
 import pybullet as p
@@ -434,6 +423,12 @@ def train_robot():
     # Стереозрение уже дает достаточно информации о глубине
     print("ℹ️  Frame stacking отключен (несовместим с Dict obs space)")
     
+    # Проверка доступности GPU
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"🖥️  Используется устройство: {device.upper()}")
+    if device == "cpu":
+        print("⚠️  GPU не найден. Для использования GPU установите: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
+    
     # Настройка модели PPO с кастомной CNN
     print("🧠 Инициализация модели PPO с NatureCNN...")
     policy_kwargs = dict(
@@ -455,6 +450,7 @@ def train_robot():
         clip_range=0.2,
         verbose=1,
         tensorboard_log="./logs/visual_rl/",
+        device=device,  # Использовать GPU если доступен
     )
     
     print("\n✅ Модель готова к обучению!")
