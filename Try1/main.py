@@ -35,6 +35,31 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 _STABLE_OBS_KEY = "pixels_proprio"
 
 
+# Device selection for PyTorch / Stable-Baselines3
+# Model training/inference will use this device when available.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Debug configuration: flip booleans to enable/disable specific logs
+# - device_info: prints chosen device at startup
+# - eval_logging: prints per-step info in evaluate_model
+# - ik_logging: prints IK targets and RMSE in _apply_action when enabled
+# - reward_logging: prints reward components inside _compute_reward
+DEBUG_CONFIG = {
+    "device_info": False,
+    "eval_logging": True,
+    "ik_logging": False,
+    "reward_logging": False,
+}
+
+if DEBUG_CONFIG.get("device_info", False):
+    print(f"Using device: {DEVICE}")
+    try:
+        import torch as _t
+        print(f"torch version: {_t.__version__}, cuda: {_t.version.cuda}")
+    except Exception:
+        pass
+
+
 class RobotArmEnv(gym.Env):
     """PyBullet-based arm reaching environment with camera-only observations."""
 
@@ -93,6 +118,8 @@ class RobotArmEnv(gym.Env):
         self.reward_weights = dict(distance=1.0, contact=50.0, time_penalty=0.1)
         self.success_threshold = 0.05
         self.success_bonus = 100.0
+        # track previous distance to compute approach-based reward (delta)
+        self.last_distance: float | None = None
         self.reset()
 
     def _load_scene(self) -> None:
@@ -139,6 +166,12 @@ class RobotArmEnv(gym.Env):
         for _ in range(self.frame_stack):
             self.frame_buffer.append(frame)
         observation = self._get_observation()
+        # initialize last_distance for approach-based reward
+        try:
+            tool_pos = np.array(p.getLinkState(self.robot_id, self.tool_link)[0])
+            self.last_distance = float(np.linalg.norm(tool_pos - self.target_pos))
+        except Exception:
+            self.last_distance = None
         return observation, {}
 
     def step(self, action: np.ndarray):
@@ -180,6 +213,16 @@ class RobotArmEnv(gym.Env):
             maxNumIterations=20,
         )
         target_positions = [joint_positions[i] for i in self.control_joints]
+        if DEBUG_CONFIG.get("ik_logging", False):
+            try:
+                curr_joints = [p.getJointState(self.robot_id, j)[0] for j in self.control_joints]
+                curr_arr = np.array(curr_joints, dtype=np.float32)
+                targ_arr = np.array(target_positions, dtype=np.float32)
+                rmse = float(np.sqrt(np.mean((curr_arr - targ_arr) ** 2)))
+                print(f"IK debug: goal_pos={goal_pos}, rmse_joints={rmse:.6f}")
+                print(f"IK debug: target_joints={targ_arr}")
+            except Exception:
+                pass
         p.setJointMotorControlArray(
             self.robot_id,
             self.control_joints,
@@ -242,14 +285,47 @@ class RobotArmEnv(gym.Env):
 
     def _compute_reward(self) -> tuple[float, bool]:
         tool_pos = np.array(p.getLinkState(self.robot_id, self.tool_link)[0])
-        distance = np.linalg.norm(tool_pos - self.target_pos)
-        reward = -self.reward_weights["distance"] * distance
-        reward -= self.reward_weights["time_penalty"]
+        distance = float(np.linalg.norm(tool_pos - self.target_pos))
+        # approach-based reward: positive when distance decreases
+        if self.last_distance is None:
+            delta = 0.0
+        else:
+            delta = float(self.last_distance - distance)
+        reward = self.reward_weights.get("approach", 1.0) * delta
+        # step/time penalty (encourages faster solutions)
+        reward -= self.reward_weights.get("time_penalty", 0.1)
+        # optional orientation reward/penalty: dot(forward, to_target)
+        orient_w = self.reward_weights.get("orientation", 0.0)
+        if orient_w != 0.0:
+            try:
+                orn = p.getLinkState(self.robot_id, self.tool_link)[1]
+                mat = p.getMatrixFromQuaternion(orn)
+                # local x-axis in world coordinates
+                forward = np.array([mat[0], mat[3], mat[6]], dtype=np.float32)
+                to_target = self.target_pos - tool_pos
+                tnorm = np.linalg.norm(to_target)
+                if tnorm > 1e-6:
+                    to_target_norm = to_target / tnorm
+                    dot = float(np.dot(forward, to_target_norm))
+                    reward += orient_w * dot
+            except Exception:
+                pass
         success = distance <= self.success_threshold
         if self._is_contact():
-            reward += self.reward_weights["contact"]
+            reward += self.reward_weights.get("contact", 50.0)
         if success:
             reward += self.success_bonus
+        if DEBUG_CONFIG.get("reward_logging", False):
+            try:
+                print(
+                    f"Reward debug: distance={distance:.6f}, delta={delta:.6f}, "
+                    f"time_penalty={self.reward_weights.get('time_penalty',0.0):.6f}, "
+                    f"contact={'yes' if self._is_contact() else 'no'}, success={success}, total_reward={reward:.6f}"
+                )
+            except Exception:
+                pass
+        # update last_distance for next step
+        self.last_distance = distance
         return float(reward), success
 
     def _is_contact(self) -> bool:
@@ -332,12 +408,14 @@ def train_model(total_timesteps: int = 150_000) -> None:
         "features_extractor_class": CustomCNN,
         "features_extractor_kwargs": {"features_dim": 256},
     }
+    # Pass the selected DEVICE to Stable-Baselines3 so it places the model on GPU when possible
     model = PPO(
         "MultiInputPolicy",
         env,
         policy_kwargs=policy_kwargs,
         verbose=1,
         tensorboard_log=tensorboard_folder,
+        device=DEVICE,
     )
     checkpoint_cb = CheckpointCallback(save_freq=5000, save_path="checkpoints", name_prefix="ppo_robot")
     model.learn(total_timesteps=total_timesteps, callback=checkpoint_cb)
@@ -346,16 +424,48 @@ def train_model(total_timesteps: int = 150_000) -> None:
 
 def evaluate_model(episodes: int = 5) -> None:
     env = make_env(render_mode="human")
-    model = PPO.load("ppo_robot_final")
+    # Load model on the chosen device (GPU if available)
+    try:
+        model = PPO.load("ppo_robot_final", device=DEVICE)
+    except TypeError:
+        # Older SB3 versions may not accept device in load; fall back to loading then moving
+        model = PPO.load("ppo_robot_final")
+        try:
+            model.to(DEVICE)
+        except Exception:
+            pass
+    env_unwrapped = env.env if hasattr(env, "env") else env
     for episode in range(episodes):
         obs, _ = env.reset()
         done = False
         total_reward = 0.0
+        step_idx = 0
+        # Print initial target info
+        try:
+            target_pos = getattr(env_unwrapped, "target_pos", None)
+        except Exception:
+            target_pos = None
+        if DEBUG_CONFIG.get("eval_logging", False):
+            print(f"Episode {episode + 1} start. Target pos: {target_pos}")
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _, _ = env.step(action)
             total_reward += reward
-        print(f"Episode {episode + 1} reward: {total_reward:.2f}")
+            step_idx += 1
+            # Try to read tool position and distance for debugging
+            try:
+                tool_pos = np.array(p.getLinkState(env_unwrapped.robot_id, env_unwrapped.tool_link)[0])
+                tgt = getattr(env_unwrapped, "target_pos", None)
+                if tgt is not None:
+                    dist = float(np.linalg.norm(tool_pos - tgt))
+                else:
+                    dist = None
+            except Exception:
+                tool_pos = None
+                dist = None
+            if DEBUG_CONFIG.get("eval_logging", False):
+                print(f"Step {step_idx}: reward={reward:.3f}, cumulative={total_reward:.3f}, dist={dist}, tool_pos={tool_pos}")
+        print(f"Episode {episode + 1} total reward: {total_reward:.2f} in {step_idx} steps")
     env.close()
 
 
